@@ -1,0 +1,4 @@
+llama-index
+python-dotenv
+httpx
+llama-index-llms-openai-like
