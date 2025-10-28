@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import csv
+import io
 import os
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urljoin
 
@@ -352,22 +355,199 @@ class EntityCounter:
 @dataclass
 class CSVAnalyzer:
     """
-    Placeholder tool dedicated to inspecting CSV datasets.
+    Inspect CSV datasets and provide lightweight analytics.
 
-    The complete implementation should:
-    - Download CSV content from remote URLs.
-    - Provide high-level summaries (headers, row count, sample rows).
-    - Answer targeted questions about records, filtered by field names and IDs.
-    - Enforce token-aware truncation when returning data to the LLM.
+    The implementation intentionally keeps the heuristics simple so the
+    surrounding agent can prompt for additional logic when required.
     """
 
     max_preview_rows: int = 5
+    timeout: float = 30.0
+    user_agent: str = "olympic-contest-csv-analyzer/0.1"
 
     def summarize(self, source: str) -> Mapping[str, Any]:
-        raise NotImplementedError("CSVAnalyzer.summarize is pending implementation.")
+        """Return headers, row count, and a lightweight sample preview."""
+        try:
+            data = self._fetch_csv(source)
+        except Exception as exc:  # pragma: no cover - defensive
+            return {"error": f"Failed to load CSV: {exc}"}
+
+        if not data:
+            return {
+                "source": source,
+                "headers": [],
+                "total_rows": 0,
+                "sample_row": None,
+                "preview": [],
+            }
+
+        headers = list(data[0].keys())
+        preview = data[: self.max_preview_rows]
+
+        return {
+            "source": source,
+            "headers": headers,
+            "total_rows": len(data),
+            "sample_row": data[0],
+            "preview": preview,
+        }
 
     def lookup(self, source: str, field: str, values: Iterable[str]) -> Mapping[str, Any]:
-        raise NotImplementedError("CSVAnalyzer.lookup is pending implementation.")
+        """Find rows where ``field`` matches one of ``values``."""
+        try:
+            data = self._fetch_csv(source)
+        except Exception as exc:  # pragma: no cover - defensive
+            return {"error": f"Failed to load CSV: {exc}"}
+
+        if not data:
+            return {"error": "CSV file is empty or could not be loaded."}
+
+        headers = list(data[0].keys())
+        if field not in headers:
+            return {
+                "error": f"Field '{field}' not found in CSV headers.",
+                "headers": headers,
+            }
+
+        lookup_values: List[str]
+        if values is None:
+            lookup_values = []
+        elif isinstance(values, str):
+            lookup_values = [values]
+        else:
+            lookup_values = list(values)
+
+        normalized_values = {str(v) for v in lookup_values if v is not None}
+        matches = [row for row in data if str(row.get(field)) in normalized_values]
+        found_values = {str(row.get(field)) for row in matches}
+        missing_values = sorted(normalized_values - found_values)
+
+        preview = matches[: self.max_preview_rows]
+
+        return {
+            "source": source,
+            "field": field,
+            "requested_values": sorted(normalized_values),
+            "total_matches": len(matches),
+            "preview": preview,
+            "missing_values": missing_values,
+        }
+
+    def query(self, source: str, question: str) -> str:
+        """
+        Answer general questions about the CSV data.
+
+        Args:
+            source: URL of the CSV file
+            question: Natural language question about the data
+
+        Returns:
+            String answer to the question
+        """
+        try:
+            data = self._fetch_csv(source)
+
+            if not data:
+                return "CSV file is empty or could not be loaded."
+
+            # Prepare context for answering
+            headers = list(data[0].keys())
+            row_count = len(data)
+
+            # This is a simple implementation - in production you might want
+            # to use the LLM to interpret the question and generate appropriate code
+            question_lower = question.lower()
+
+            # Handle common question patterns (English)
+            if "how many" in question_lower or "count" in question_lower:
+                if "column" in question_lower or "field" in question_lower:
+                    return f"The CSV has {len(headers)} columns: {', '.join(headers)}"
+                elif "row" in question_lower or "record" in question_lower:
+                    return f"The CSV has {row_count} rows."
+
+            if "what are" in question_lower and ("column" in question_lower or "field" in question_lower):
+                return f"Columns: {', '.join(headers)}"
+
+            if "first" in question_lower or "sample" in question_lower:
+                sample = data[:3]
+                return f"Sample rows:\n" + "\n".join([str(row) for row in sample])
+
+            # Handle a minimal set of Persian prompts.
+            persian_question = question.strip()
+            if persian_question and ("چند" in persian_question and ("ردیف" in persian_question or "ستون" in persian_question)):
+                return (
+                    f"فایل دارای {row_count} ردیف و {len(headers)} ستون است. "
+                    f"ستون‌ها عبارتند از: {', '.join(headers)}"
+                )
+
+            # Default response with summary
+            return (
+                f"CSV Summary:\n"
+                f"- Total rows: {row_count}\n"
+                f"- Columns: {', '.join(headers)}\n"
+                f"- Sample data: {data[0]}"
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            return f"Failed to answer question: {str(e)}"
+
+    def run(self, **kwargs) -> Any:
+        """
+        Generic run method to handle different operations.
+
+        Supported operations:
+        - summarize: Get summary of CSV
+        - lookup: Find records by field value
+        - query: Answer natural language questions
+        """
+        operation = kwargs.get("operation", "summarize")
+        source = kwargs.get("source") or kwargs.get("url")
+
+        if not source:
+            return {"error": "Source URL is required"}
+
+        if operation == "summarize":
+            return self.summarize(source)
+        elif operation == "lookup":
+            field = kwargs.get("field", "id")
+            values = kwargs.get("values", [])
+            return self.lookup(source, field, values)
+        elif operation == "query":
+            question = kwargs.get("question", "")
+            return self.query(source, question)
+        else:
+            return {"error": f"Unknown operation: {operation}"}
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _fetch_csv(self, source: str) -> List[Dict[str, str]]:
+        """Download or read CSV content and return it as dictionaries."""
+        if not source:
+            raise ValueError("CSV source must be provided.")
+
+        if source.startswith("http://") or source.startswith("https://"):
+            headers = {"User-Agent": self.user_agent}
+            try:
+                with httpx.Client(timeout=self.timeout, headers=headers) as client:
+                    response = client.get(source)
+                    response.raise_for_status()
+                    text = response.text
+            except httpx.HTTPError as exc:
+                raise RuntimeError(f"Failed to fetch remote CSV: {exc}") from exc
+        else:
+            path = Path(source)
+            if not path.exists():
+                raise FileNotFoundError(f"CSV file not found at {source}")
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+
+        buffer = io.StringIO(text)
+        reader = csv.DictReader(buffer)
+        data = [dict(row) for row in reader]
+        return data
 
 
 @dataclass
