@@ -653,10 +653,15 @@ class ContestantAgent:
             history: List of (prompt, response) tuples representing past attempts.
         """
         prompt_text = self._extract_prompt(problem)
+        input_files = self._extract_input_files(problem)
 
-        tool_context = self._gather_tool_context(prompt_text)
+        fast_answer = self._try_answer_with_csv_tool(prompt_text, input_files)
+        if fast_answer:
+            return fast_answer
 
-        prompt = self._construct_prompt(prompt_text, history, tool_context)
+        tool_context = self._gather_tool_context(prompt_text, input_files)
+
+        prompt = self._construct_prompt(prompt_text, history, tool_context, input_files)
 
         try:
             completion = self.llm.complete(prompt)
@@ -679,13 +684,16 @@ class ContestantAgent:
         prompt_text: str,
         history: List[Tuple[str, str]],
         tool_context: Optional[str],
+        input_files: Sequence[Mapping[str, Any]],
     ) -> str:
         formatted_history = self._format_history(history)
+        files_section = self._format_input_files(input_files)
 
         sections = [
             f"System: {self.system_prompt}",
             formatted_history,
             tool_context or "",
+            files_section or "",
             "Current Lock Prompt:",
             prompt_text,
             "Required Output: Provide only the final answer as a single string.",
@@ -705,6 +713,18 @@ class ContestantAgent:
         return str(problem)
 
     @staticmethod
+    def _extract_input_files(problem: Dict[str, Any] | str) -> List[Mapping[str, Any]]:
+        if isinstance(problem, Mapping):
+            files = problem.get("input_files")
+            if isinstance(files, Sequence):
+                result: List[Mapping[str, Any]] = []
+                for file in files:
+                    if isinstance(file, Mapping):
+                        result.append(file)
+                return result
+        return []
+
+    @staticmethod
     def _format_history(history: List[Tuple[str, str]]) -> str:
         if not history:
             return ""
@@ -715,11 +735,200 @@ class ContestantAgent:
             lines.append(f"[Attempt {idx}] Answer: {attempt_answer}")
         return "\n".join(lines)
 
-    def _gather_tool_context(self, prompt_text: str) -> Optional[str]:
+    @staticmethod
+    def _format_input_files(input_files: Sequence[Mapping[str, Any]]) -> Optional[str]:
+        if not input_files:
+            return None
+
+        lines = ["Attached Files:"]
+        for file_info in input_files:
+            name = str(file_info.get("filename") or file_info.get("name") or "unnamed")
+            file_type = str(file_info.get("type") or "unknown")
+            url = file_info.get("url") or file_info.get("source")
+            description = file_info.get("description")
+
+            parts = [f"{name} ({file_type})"]
+            if description:
+                parts.append(str(description))
+            if url:
+                parts.append(str(url))
+
+            lines.append("- " + " – ".join(parts))
+
+        return "\n".join(lines)
+
+    def _gather_tool_context(
+        self,
+        prompt_text: str,
+        input_files: Sequence[Mapping[str, Any]],
+    ) -> Optional[str]:
         urls = self._extract_urls(prompt_text)
+        for file_info in input_files:
+            url = file_info.get("url") or file_info.get("source")
+            if url:
+                urls.append(str(url))
+
+        if urls:
+            urls = list(dict.fromkeys(urls))
+
         if not urls:
             return None
 
+        contexts: List[str] = []
+
+        csv_context = self._build_csv_context(prompt_text, urls, input_files)
+        if csv_context:
+            contexts.append(csv_context)
+
+        entity_context = self._build_entity_context(prompt_text, urls)
+        if entity_context:
+            contexts.append(entity_context)
+
+        if contexts:
+            return "\n\n".join(contexts)
+        return None
+
+    def _try_answer_with_csv_tool(
+        self,
+        prompt_text: str,
+        input_files: Sequence[Mapping[str, Any]],
+    ) -> Optional[str]:
+        csv_tool = self.tools.get("csv_analyzer")
+        if not isinstance(csv_tool, CSVAnalyzer):
+            return None
+
+        urls = self._extract_urls(prompt_text)
+        csv_urls = [url for url in urls if self._is_csv_url(url)]
+        for file_info in input_files:
+            url = file_info.get("url") or file_info.get("source")
+            if url and self._is_csv_url(str(url)):
+                csv_urls.append(str(url))
+        if not csv_urls:
+            return None
+
+        lowered = prompt_text.lower()
+        row_keywords = ("row", "rows", "record", "records")
+        column_keywords = ("column", "columns", "field", "fields", "header", "headers")
+        persian_terms = ("ردیف", "ستون")
+        asks_rows = any(token in lowered for token in row_keywords) or "چند" in prompt_text and "ردیف" in prompt_text
+        asks_columns = any(token in lowered for token in column_keywords) or "چند" in prompt_text and "ستون" in prompt_text
+        wants_headers = (
+            "header" in lowered
+            or "headers" in lowered
+            or ("column" in lowered and ("list" in lowered or "name" in lowered or "names" in lowered))
+            or ("ستون" in prompt_text and "نام" in prompt_text)
+        )
+        wants_sample = "sample" in lowered or "first" in lowered
+
+        if not (asks_rows or asks_columns or wants_headers or wants_sample):
+            return None
+
+        source = csv_urls[0]
+        summary = csv_tool.summarize(source)
+        if not isinstance(summary, Mapping) or summary.get("error"):
+            return None
+
+        headers = summary.get("headers", [])
+        row_count = summary.get("total_rows")
+        sample_row = summary.get("sample_row")
+        col_count = len(headers)
+
+        if wants_headers and headers:
+            return ", ".join(headers)
+
+        if asks_rows and asks_columns and "چند" in prompt_text:
+            return (
+                f"فایل دارای {row_count} ردیف و {col_count} ستون است. "
+                f"ستون‌ها عبارتند از: {', '.join(headers)}"
+            )
+
+        if asks_rows and not asks_columns and row_count is not None:
+            if "چند" in prompt_text:
+                return f"فایل دارای {row_count} ردیف است."
+            return str(row_count)
+
+        if asks_columns and not asks_rows:
+            if "چند" in prompt_text:
+                return f"فایل دارای {col_count} ستون است."
+            return str(col_count)
+
+        if asks_rows and asks_columns:
+            if "csv" in lowered or "file" in lowered:
+                return f"rows={row_count}, columns={col_count}"
+            return f"{row_count} rows, {col_count} columns"
+
+        if wants_sample and sample_row:
+            return str(sample_row)
+
+        answer = csv_tool.query(source, prompt_text)
+        if answer.startswith("Failed"):
+            return None
+        return answer
+
+    def _build_csv_context(
+        self,
+        prompt_text: str,
+        urls: Sequence[str],
+        input_files: Sequence[Mapping[str, Any]],
+    ) -> Optional[str]:
+        csv_tool = self.tools.get("csv_analyzer")
+        if not isinstance(csv_tool, CSVAnalyzer):
+            return None
+
+        csv_urls = [url for url in urls if self._is_csv_url(url)]
+        if not csv_urls:
+            return None
+
+        lowered = prompt_text.lower()
+        triggers = ("csv", "row", "rows", "column", "columns", "header", "headers", "sample")
+        persian_triggers = ("ردیف", "ستون")
+        has_trigger = any(trigger in lowered for trigger in triggers) or any(
+            trig in prompt_text for trig in persian_triggers
+        )
+        csv_from_files = any(
+            self._is_csv_url(str(file_info.get("url") or file_info.get("source")))
+            for file_info in input_files
+        )
+        if not has_trigger and not csv_from_files:
+            return None
+
+        summaries: List[str] = []
+        file_lookup: Dict[str, Mapping[str, Any]] = {}
+        for file_info in input_files:
+            url = file_info.get("url") or file_info.get("source")
+            if url:
+                file_lookup[str(url)] = file_info
+
+        for source in csv_urls[:2]:  # limit to first two sources for brevity
+            summary = csv_tool.summarize(source)
+            if not isinstance(summary, Mapping):
+                continue
+            if summary.get("error"):
+                continue
+            headers = summary.get("headers", [])
+            total_rows = summary.get("total_rows")
+            sample_row = summary.get("sample_row")
+            label = file_lookup.get(source, {}).get("filename")
+            if label:
+                header_line = f"- File: {label}"
+            else:
+                header_line = f"- Source: {source}"
+            lines = [
+                "Tool Observation (CSV Analyzer):",
+                header_line,
+                f"- URL: {source}",
+                f"- Headers: {headers}",
+                f"- Total rows: {total_rows}",
+            ]
+            if sample_row:
+                lines.append(f"- Sample row: {sample_row}")
+            summaries.append("\n".join(lines))
+
+        if summaries:
+            return "\n\n".join(summaries)
+        return None
+
+    def _build_entity_context(self, prompt_text: str, urls: Sequence[str]) -> Optional[str]:
         lowered = prompt_text.lower()
         if "how many" not in lowered and "count" not in lowered:
             return None
@@ -757,6 +966,11 @@ class ContestantAgent:
             context_lines.append(f"- Per target: {details}")
 
         return "\n".join(context_lines)
+
+    @staticmethod
+    def _is_csv_url(url: str) -> bool:
+        normalized = url.lower().split("?", 1)[0]
+        return normalized.endswith(".csv")
 
     @staticmethod
     def _extract_urls(prompt_text: str) -> List[str]:

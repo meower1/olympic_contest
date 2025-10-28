@@ -23,7 +23,9 @@ def main() -> None:
 
     api_key = os.getenv("METIS_API_KEY")
     if not api_key or api_key == "CHANGE_ME":
-        raise RuntimeError("Set METIS_API_KEY in the environment or .env before running.")
+        raise RuntimeError(
+            "Set METIS_API_KEY in the environment or .env before running."
+        )
 
     agent = ContestantAgent(api_key=api_key)
     result = agent.solve_lock(PROMPT, history=[])
