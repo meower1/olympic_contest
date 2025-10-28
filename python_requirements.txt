@@ -1,4 +1,5 @@
 llama-index
 python-dotenv
 httpx
+beautifulsoup4
 llama-index-llms-openai-like
